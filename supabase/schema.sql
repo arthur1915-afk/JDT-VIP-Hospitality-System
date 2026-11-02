@@ -147,10 +147,6 @@ alter table public.service_requests enable row level security;
 drop policy if exists "profile read own or staff" on public.profiles;
 create policy "profile read own or staff" on public.profiles for select to authenticated
 using (id = auth.uid() or public.is_staff_or_admin());
-drop policy if exists "profile update own name only" on public.profiles;
-create policy "profile update own name only" on public.profiles for update to authenticated
-using (id = auth.uid())
-with check (id = auth.uid() and role = (select p.role from public.profiles p where p.id = auth.uid()) and vendor_id is not distinct from (select p.vendor_id from public.profiles p where p.id = auth.uid()));
 drop policy if exists "admin manage profiles" on public.profiles;
 create policy "admin manage profiles" on public.profiles for all to authenticated
 using (public.is_admin()) with check (public.is_admin());
@@ -213,3 +209,95 @@ on conflict (name) do nothing;
 -- update public.profiles set role = 'admin' where id = '<AUTH_USER_UUID>';
 -- update public.profiles set role = 'vendor', vendor_id = (select id from public.vendors where name='Concessions')
 -- where id = '<AUTH_USER_UUID>';
+
+
+-- Trusted order creation: prices and totals are calculated from the database catalogue.
+drop policy if exists "guest create own orders" on public.orders;
+drop policy if exists "guest add items to own received order" on public.order_items;
+
+create or replace function public.create_guest_order(
+  p_guest_name text,
+  p_booth text,
+  p_vendor_id uuid,
+  p_notes text,
+  p_items jsonb
+)
+returns table(order_id uuid, order_number text, total_myr numeric)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_order_id uuid;
+  v_total numeric(10,2);
+  v_item jsonb;
+  v_menu public.menu_items%rowtype;
+  v_qty integer;
+begin
+  if auth.uid() is null then
+    raise exception 'Authentication required';
+  end if;
+  if length(trim(coalesce(p_guest_name,''))) = 0 or length(trim(coalesce(p_booth,''))) = 0 then
+    raise exception 'Guest name and booth are required';
+  end if;
+  if jsonb_typeof(p_items) <> 'array' or jsonb_array_length(p_items) = 0 then
+    raise exception 'At least one menu item is required';
+  end if;
+  if not exists(select 1 from public.vendors v where v.id=p_vendor_id and v.active) then
+    raise exception 'Vendor is unavailable';
+  end if;
+
+  v_total := 0;
+  for v_item in select value from jsonb_array_elements(p_items)
+  loop
+    v_qty := (v_item->>'quantity')::integer;
+    if v_qty < 1 or v_qty > 100 then raise exception 'Invalid item quantity'; end if;
+    select * into v_menu from public.menu_items
+      where id=(v_item->>'menu_item_id')::uuid
+        and vendor_id=p_vendor_id and available=true;
+    if not found then raise exception 'Menu item unavailable for selected vendor'; end if;
+    v_total := v_total + (v_menu.price_myr * v_qty);
+  end loop;
+
+  insert into public.orders(guest_id,guest_name,booth,vendor_id,notes,total_myr)
+  values(auth.uid(),trim(p_guest_name),trim(p_booth),p_vendor_id,coalesce(p_notes,''),v_total)
+  returning id into v_order_id;
+
+  for v_item in select value from jsonb_array_elements(p_items)
+  loop
+    v_qty := (v_item->>'quantity')::integer;
+    select * into v_menu from public.menu_items where id=(v_item->>'menu_item_id')::uuid;
+    insert into public.order_items(order_id,menu_item_id,item_name,quantity,unit_price_myr)
+    values(v_order_id,v_menu.id,v_menu.name,v_qty,v_menu.price_myr);
+  end loop;
+
+  return query select o.id,o.order_number,o.total_myr from public.orders o where o.id=v_order_id;
+end;
+$$;
+
+revoke all on function public.create_guest_order(text,text,uuid,text,jsonb) from public, anon;
+grant execute on function public.create_guest_order(text,text,uuid,text,jsonb) to authenticated;
+
+-- Status changes are performed through a constrained function, not arbitrary row edits.
+drop policy if exists "staff update orders" on public.orders;
+create or replace function public.update_order_status(p_order_id uuid,p_status text)
+returns void language plpgsql security definer
+set search_path = public
+as $$
+declare v_role text; v_vendor_id uuid;
+begin
+  select role,vendor_id into v_role,v_vendor_id from public.profiles where id=auth.uid();
+  if v_role is null or p_status not in ('received','accepted','preparing','ready','delivered','cancelled') then
+    raise exception 'Not authorised or invalid status';
+  end if;
+  if v_role not in ('staff','admin','vendor') then raise exception 'Not authorised'; end if;
+  if v_role='vendor' and not exists(select 1 from public.orders where id=p_order_id and vendor_id=v_vendor_id) then
+    raise exception 'Order is not assigned to this vendor';
+  end if;
+  update public.orders set status=p_status where id=p_order_id;
+  if not found then raise exception 'Order not found'; end if;
+end;
+$$;
+revoke all on function public.update_order_status(uuid,text) from public, anon;
+grant execute on function public.update_order_status(uuid,text) to authenticated;
+
