@@ -301,3 +301,21 @@ $$;
 revoke all on function public.update_order_status(uuid,text) from public, anon;
 grant execute on function public.update_order_status(uuid,text) to authenticated;
 
+
+-- Starter catalogue. Review prices, descriptions and availability before launch.
+insert into public.menu_items(vendor_id,name,description,price_myr)
+select v.id, x.name, x.description, x.price
+from (values
+ ('JDT Hospitality Kitchen','VIP Signature Burger','Beef patty, aged cheddar, house sauce',28.00::numeric),
+ ('JDT Hospitality Kitchen','Grilled Chicken Wrap','Grilled chicken, fresh greens',22.00::numeric),
+ ('Premium Lounge','Premium Fruit Platter','Seasonal fresh fruit selection',25.00::numeric),
+ ('Stadium Beverage Service','Sparkling Water','Chilled bottled water',8.00::numeric),
+ ('Stadium Beverage Service','Fresh Orange Juice','Freshly prepared juice',12.00::numeric),
+ ('Premium Lounge','Coffee','Espresso-based hot coffee',12.00::numeric),
+ ('Concessions','Nachos & Cheese','Crispy nachos with cheese dip',18.00::numeric),
+ ('Concessions','Soft Drink','Chilled soft drink',7.00::numeric)
+) as x(vendor_name,name,description,price)
+join public.vendors v on v.name=x.vendor_name
+where not exists (
+ select 1 from public.menu_items m where m.vendor_id=v.id and m.name=x.name
+);
